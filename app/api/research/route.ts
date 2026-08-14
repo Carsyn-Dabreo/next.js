@@ -6,67 +6,161 @@ type Source = {
   url: string;
   snippet: string;
   type: "Wikipedia" | "arXiv";
+  score?: number;
 };
 
 const AI_TIMEOUT_MS = 25000;
 
+const STOP_WORDS = new Set([
+  "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
+  "how", "in", "into", "is", "it", "of", "on", "or", "the", "to",
+  "what", "which", "with", "why", "compare", "comparison", "explain",
+  "best", "current", "latest", "using", "use", "about",
+]);
+
+function normalize(text: string) {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getQueryTerms(query: string) {
+  return normalize(query)
+    .split(" ")
+    .filter((term) => term.length >= 2 && !STOP_WORDS.has(term));
+}
+
+function scoreSource(source: Source, query: string) {
+  const terms = getQueryTerms(query);
+  const title = normalize(source.title);
+  const snippet = normalize(source.snippet);
+  const full = `${title} ${snippet}`;
+
+  if (!terms.length) return 0;
+
+  let score = 0;
+
+  for (const term of terms) {
+    if (title.includes(term)) score += 8;
+    if (snippet.includes(term)) score += 2;
+  }
+
+  // Strongly reward the presence of the main technical acronym/phrase.
+  const normalizedQuery = normalize(query);
+  if (normalizedQuery.includes("rag") && full.includes("rag")) score += 14;
+  if (normalizedQuery.includes("llm") && full.includes("llm")) score += 10;
+  if (normalizedQuery.includes("retrieval") && full.includes("retrieval")) score += 8;
+
+  // Academic papers are generally more useful for technical research.
+  if (source.type === "arXiv") score += 3;
+
+  // Penalize sources with no meaningful overlap at all.
+  const matchedTerms = terms.filter((term) => full.includes(term)).length;
+  if (matchedTerms === 0) score -= 20;
+
+  return score;
+}
+
+function rankSources(sources: Source[], query: string) {
+  const unique = new Map<string, Source>();
+
+  for (const source of sources) {
+    const key = source.url.toLowerCase();
+    if (!unique.has(key)) unique.set(key, source);
+  }
+
+  return Array.from(unique.values())
+    .map((source) => ({ ...source, score: scoreSource(source, query) }))
+    .filter((source) => (source.score ?? 0) > 0)
+    .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+    .slice(0, 8)
+    .map(({ score: _score, ...source }, index) => ({
+      ...source,
+      id: `S${index + 1}`,
+    }));
+}
+
 async function retrieveSources(query: string): Promise<Source[]> {
   const sources: Source[] = [];
 
-  // Run both retrieval providers in parallel so the UI does not sit waiting
-  // on one provider before the other one starts.
   const [wikiResult, arxivResult] = await Promise.allSettled([
     (async () => {
-      const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&format=json&srlimit=4&origin=*`;
-      const response = await fetch(wikiUrl, { cache: "no-store", signal: AbortSignal.timeout(10000) });
+      const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&format=json&srlimit=6&origin=*`;
+      const response = await fetch(wikiUrl, {
+        cache: "no-store",
+        signal: AbortSignal.timeout(10000),
+      });
       if (!response.ok) return [] as Source[];
+
       const data = await response.json();
-      return (data?.query?.search ?? []).map((item: { title: string; snippet?: string }, index: number) => ({
-        id: `S${index + 1}`,
-        title: item.title,
-        url: `https://en.wikipedia.org/wiki/${encodeURIComponent(item.title.replace(/ /g, "_"))}`,
-        snippet: String(item.snippet ?? "").replace(/<[^>]+>/g, ""),
-        type: "Wikipedia" as const,
-      }));
+      return (data?.query?.search ?? []).map(
+        (item: { title: string; snippet?: string }) => ({
+          id: "",
+          title: item.title,
+          url: `https://en.wikipedia.org/wiki/${encodeURIComponent(item.title.replace(/ /g, "_"))}`,
+          snippet: String(item.snippet ?? "").replace(/<[^>]+>/g, ""),
+          type: "Wikipedia" as const,
+        })
+      );
     })(),
     (async () => {
-      const arxivUrl = `https://export.arxiv.org/api/query?search_query=all:${encodeURIComponent(query)}&start=0&max_results=5&sortBy=relevance&sortOrder=descending`;
-      const response = await fetch(arxivUrl, { cache: "no-store", signal: AbortSignal.timeout(10000) });
+      const arxivUrl = `https://export.arxiv.org/api/query?search_query=all:${encodeURIComponent(query)}&start=0&max_results=8&sortBy=relevance&sortOrder=descending`;
+      const response = await fetch(arxivUrl, {
+        cache: "no-store",
+        signal: AbortSignal.timeout(10000),
+      });
       if (!response.ok) return [] as Source[];
+
       const xml = await response.text();
       const entries = xml.match(/<entry>[\s\S]*?<\/entry>/g) ?? [];
-      return entries.map((entry, index) => {
-        const title = entry.match(/<title>([\s\S]*?)<\/title>/)?.[1]?.replace(/\s+/g, " ").trim();
-        const summary = entry.match(/<summary>([\s\S]*?)<\/summary>/)?.[1]?.replace(/\s+/g, " ").trim();
-        const id = entry.match(/<id>([\s\S]*?)<\/id>/)?.[1]?.trim();
-        if (!title || !id) return null;
-        return {
-          id: `ARXIV-${index + 1}`,
-          title,
-          url: id,
-          snippet: summary ?? "",
-          type: "arXiv" as const,
-        };
-      }).filter(Boolean) as Source[];
+
+      return entries
+        .map((entry): Source | null => {
+          const title = entry
+            .match(/<title>([\s\S]*?)<\/title>/)?.[1]
+            ?.replace(/\s+/g, " ")
+            .trim();
+          const summary = entry
+            .match(/<summary>([\s\S]*?)<\/summary>/)?.[1]
+            ?.replace(/\s+/g, " ")
+            .trim();
+          const id = entry.match(/<id>([\s\S]*?)<\/id>/)?.[1]?.trim();
+
+          if (!title || !id) return null;
+
+          return {
+            id: "",
+            title,
+            url: id,
+            snippet: summary ?? "",
+            type: "arXiv",
+          };
+        })
+        .filter(Boolean) as Source[];
     })(),
   ]);
 
   if (wikiResult.status === "fulfilled") sources.push(...wikiResult.value);
   if (arxivResult.status === "fulfilled") sources.push(...arxivResult.value);
 
-  return sources.slice(0, 8).map((source, index) => ({ ...source, id: `S${index + 1}` }));
+  return rankSources(sources, query);
 }
 
 function buildFallbackAnswer(query: string, sources: Source[]) {
   if (!sources.length) {
-    return `## Executive Summary\n\nI could not retrieve external sources for **${query}**. The research service is still available, but no evidence was returned by the retrieval providers.\n\n## Limitations\n\nNo source-backed answer can be generated until external evidence is available.`;
+    return `## Executive Summary\n\nI could not retrieve sufficiently relevant external sources for **${query}**.\n\n## Limitations\n\nNo source-backed answer can be generated until relevant evidence is available.`;
   }
 
-  const findings = sources.map((source) =>
-    `- **${source.title}** — ${source.snippet.slice(0, 500)} [${source.id}]`
-  ).join("\n");
+  const findings = sources
+    .map(
+      (source) =>
+        `- **${source.title}** — ${source.snippet.slice(0, 500)} [${source.id}]`
+    )
+    .join("\n");
 
-  return `## Executive Summary\n\nHere is a source-backed research brief for **${query}**. The AI synthesis service was unavailable or timed out, so this response uses the retrieved evidence directly rather than inventing unsupported claims.\n\n## Key Findings\n\n${findings}\n\n## Important Insights\n\n- The retrieved evidence provides a starting point for answering the research question.\n- Claims should be checked against the linked primary sources before being used in academic or professional work.\n\n## Limitations\n\n- Automated synthesis was unavailable for this request.\n- Retrieval results may be incomplete.\n\n## Further Research\n\nReview the linked sources and run the query again to generate a full AI-synthesized report.`;
+  return `## Executive Summary\n\nHere is a source-backed research brief for **${query}**. The AI synthesis service was unavailable or timed out, so this response uses the retrieved evidence directly rather than inventing unsupported claims.\n\n## Key Findings\n\n${findings}\n\n## Important Insights\n\n- The retrieved evidence provides a starting point for answering the research question.\n- Claims should be checked against the linked primary sources before academic or professional use.\n\n## Limitations\n\n- Automated synthesis was unavailable for this request.\n- Retrieval results may be incomplete.\n\n## Further Research\n\nReview the linked sources and run the query again to generate a full AI-synthesized report.`;
 }
 
 async function generateWithOpenRouter(apiKey: string, query: string, context: string) {
@@ -84,8 +178,6 @@ async function generateWithOpenRouter(apiKey: string, query: string, context: st
       },
       signal: controller.signal,
       body: JSON.stringify({
-        // A specific free model is more predictable than randomly routing
-        // every request across the free-model pool.
         model: "openai/gpt-oss-20b:free",
         temperature: 0.2,
         max_tokens: 1800,
@@ -106,7 +198,9 @@ async function generateWithOpenRouter(apiKey: string, query: string, context: st
     const responseText = await response.text();
 
     if (!response.ok) {
-      throw new Error(`OpenRouter error (${response.status}): ${responseText.slice(0, 500)}`);
+      throw new Error(
+        `OpenRouter error (${response.status}): ${responseText.slice(0, 500)}`
+      );
     }
 
     const data = JSON.parse(responseText);
@@ -124,7 +218,10 @@ export async function POST(request: NextRequest) {
 
     if (!apiKey) {
       return NextResponse.json(
-        { error: "OPENROUTER_API_KEY is missing. Add it to .env.local and restart the server." },
+        {
+          error:
+            "OPENROUTER_API_KEY is missing. Add it to .env.local and restart the server.",
+        },
         { status: 500 }
       );
     }
@@ -133,14 +230,23 @@ export async function POST(request: NextRequest) {
     const query = body.query;
 
     if (!query || typeof query !== "string") {
-      return NextResponse.json({ error: "A research query is required." }, { status: 400 });
+      return NextResponse.json(
+        { error: "A research query is required." },
+        { status: 400 }
+      );
     }
 
-    console.log("Retrieving sources for:", query);
+    console.log("Retrieving and ranking sources for:", query);
     const sources = await retrieveSources(query);
+
     const context = sources.length
-      ? sources.map((source) => `[${source.id}] ${source.title}\nURL: ${source.url}\nEvidence: ${source.snippet}`).join("\n\n")
-      : "No external sources were retrieved. Clearly state that limitation.";
+      ? sources
+          .map(
+            (source) =>
+              `[${source.id}] ${source.title}\nURL: ${source.url}\nEvidence: ${source.snippet}`
+          )
+          .join("\n\n")
+      : "No sufficiently relevant external sources were retrieved. Clearly state that limitation.";
 
     let answer: string;
     let usedFallback = false;
@@ -148,9 +254,10 @@ export async function POST(request: NextRequest) {
     try {
       answer = await generateWithOpenRouter(apiKey, query, context);
     } catch (error) {
-      // Never leave the frontend stuck on "Researching..." because a free
-      // provider is rate-limited, unavailable, or slow.
-      console.warn("AI synthesis unavailable; returning retrieval fallback:", error);
+      console.warn(
+        "AI synthesis unavailable; returning retrieval fallback:",
+        error
+      );
       answer = buildFallbackAnswer(query, sources);
       usedFallback = true;
     }
@@ -166,7 +273,10 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     console.error("Research API error:", error);
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Unexpected server error." },
+      {
+        error:
+          error instanceof Error ? error.message : "Unexpected server error.",
+      },
       { status: 500 }
     );
   }
