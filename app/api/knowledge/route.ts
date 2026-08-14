@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import fs from "fs/promises";
 import path from "path";
 import pdfParse from "pdf-parse";
+import { PDFDocument } from "pdf-lib";
 
 export const runtime = "nodejs";
 
@@ -87,10 +88,26 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "File is too large. Maximum size is 10 MB." }, { status: 400 });
     }
 
-    const buffer = Buffer.from(await file.arrayBuffer());
+    let buffer = Buffer.from(await file.arrayBuffer());
     let text = "";
 
     if (extension === "pdf" || file.type === "application/pdf") {
+      // Keep the uploaded file binary, but normalize it into a fresh PDF so
+      // browsers do not fail on malformed or stale XRef tables.
+      try {
+        const pdf = await PDFDocument.load(buffer, {
+          ignoreEncryption: true,
+          updateMetadata: false,
+        });
+        const normalizedPdf = await pdf.save({
+          useObjectStreams: false,
+          addDefaultPage: false,
+        });
+        buffer = Buffer.from(normalizedPdf);
+      } catch (repairError) {
+        console.warn("PDF normalization skipped:", repairError);
+      }
+
       const parsed = await pdfParse(buffer);
       text = parsed.text;
     } else {
@@ -111,7 +128,7 @@ export async function POST(request: NextRequest) {
       name: file.name,
       type: extension ?? file.type,
       mimeType,
-      size: file.size,
+      size: buffer.length,
       createdAt: new Date().toISOString(),
       chunks: pieces.length,
     };
@@ -134,7 +151,7 @@ export async function POST(request: NextRequest) {
       success: true,
       document,
       chunkCount: newChunks.length,
-      message: `${file.name} was extracted, saved and indexed into ${newChunks.length} searchable chunks.`,
+      message: `${file.name} was extracted, normalized, saved and indexed into ${newChunks.length} searchable chunks.`,
     });
   } catch (error) {
     console.error("Knowledge Base upload error:", error);
@@ -154,11 +171,15 @@ export async function DELETE(request: NextRequest) {
     store.documents = store.documents.filter((document) => document.id !== documentId);
     store.chunks = store.chunks.filter((chunk) => chunk.documentId !== documentId);
     if (documentExists) {
-      try { await fs.unlink(path.join(DOCUMENTS_DIR, documentId)); } catch { /* legacy upload or missing file */ }
+      try {
+        await fs.unlink(path.join(DOCUMENTS_DIR, documentId));
+      } catch {
+        // Legacy upload or missing file.
+      }
     }
     await writeStore(store);
     return NextResponse.json({ success: true });
-  } catch (error) {
+  } catch {
     return NextResponse.json({ error: "Failed to delete document." }, { status: 500 });
   }
 }
