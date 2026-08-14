@@ -3,6 +3,7 @@ import fs from "fs/promises";
 import path from "path";
 import pdfParse from "pdf-parse";
 import { PDFDocument } from "pdf-lib";
+import { embedTexts } from "@/lib/embeddings";
 
 export const runtime = "nodejs";
 
@@ -15,6 +16,7 @@ type Chunk = {
   documentId: string;
   documentName: string;
   text: string;
+  embedding?: number[];
 };
 
 type DocumentRecord = {
@@ -25,6 +27,7 @@ type DocumentRecord = {
   size: number;
   createdAt: string;
   chunks: number;
+  embeddingModel?: string;
 };
 
 type Store = {
@@ -66,6 +69,8 @@ export async function GET() {
     documents: store.documents,
     documentCount: store.documents.length,
     chunkCount: store.chunks.length,
+    semanticSearch: store.chunks.some((chunk) => Array.isArray(chunk.embedding)),
+    embeddingModel: "Xenova/all-MiniLM-L6-v2",
   });
 }
 
@@ -92,22 +97,13 @@ export async function POST(request: NextRequest) {
     let text = "";
 
     if (extension === "pdf" || file.type === "application/pdf") {
-      // Keep the uploaded file binary, but normalize it into a fresh PDF so
-      // browsers do not fail on malformed or stale XRef tables.
       try {
-        const pdf = await PDFDocument.load(buffer, {
-          ignoreEncryption: true,
-          updateMetadata: false,
-        });
-        const normalizedPdf = await pdf.save({
-          useObjectStreams: false,
-          addDefaultPage: false,
-        });
+        const pdf = await PDFDocument.load(buffer, { ignoreEncryption: true, updateMetadata: false });
+        const normalizedPdf = await pdf.save({ useObjectStreams: false, addDefaultPage: false });
         buffer = Buffer.from(normalizedPdf);
       } catch (repairError) {
         console.warn("PDF normalization skipped:", repairError);
       }
-
       const parsed = await pdfParse(buffer);
       text = parsed.text;
     } else {
@@ -123,6 +119,15 @@ export async function POST(request: NextRequest) {
     const pieces = chunkText(text);
     const mimeType = file.type || (extension === "pdf" ? "application/pdf" : extension === "md" ? "text/markdown" : "text/plain");
 
+    let embeddings: number[][] = [];
+    let embeddingModel: string | undefined;
+    try {
+      embeddings = await embedTexts(pieces);
+      embeddingModel = "Xenova/all-MiniLM-L6-v2";
+    } catch (embeddingError) {
+      console.warn("Semantic embedding generation failed; keeping lexical indexing:", embeddingError);
+    }
+
     const document: DocumentRecord = {
       id: documentId,
       name: file.name,
@@ -131,6 +136,7 @@ export async function POST(request: NextRequest) {
       size: buffer.length,
       createdAt: new Date().toISOString(),
       chunks: pieces.length,
+      embeddingModel,
     };
 
     const newChunks: Chunk[] = pieces.map((piece, index) => ({
@@ -138,6 +144,7 @@ export async function POST(request: NextRequest) {
       documentId,
       documentName: file.name,
       text: piece,
+      ...(embeddings[index] ? { embedding: embeddings[index] } : {}),
     }));
 
     await fs.mkdir(DOCUMENTS_DIR, { recursive: true });
@@ -147,18 +154,17 @@ export async function POST(request: NextRequest) {
     store.chunks.push(...newChunks);
     await writeStore(store);
 
+    const mode = embeddings.length === pieces.length ? "semantic embeddings + keyword indexing" : "keyword indexing";
     return NextResponse.json({
       success: true,
       document,
       chunkCount: newChunks.length,
-      message: `${file.name} was extracted, normalized, saved and indexed into ${newChunks.length} searchable chunks.`,
+      semanticSearch: embeddings.length === pieces.length,
+      message: `${file.name} was extracted, normalized, saved and indexed into ${newChunks.length} searchable chunks using ${mode}.`,
     });
   } catch (error) {
     console.error("Knowledge Base upload error:", error);
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Failed to index document." },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: error instanceof Error ? error.message : "Failed to index document." }, { status: 500 });
   }
 }
 
