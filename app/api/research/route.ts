@@ -5,279 +5,164 @@ type Source = {
   title: string;
   url: string;
   snippet: string;
-  type: "Wikipedia" | "arXiv";
+  type: "Wikipedia" | "arXiv" | "OpenAlex";
   score?: number;
 };
 
 const AI_TIMEOUT_MS = 25000;
 
-const STOP_WORDS = new Set([
-  "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
-  "how", "in", "into", "is", "it", "of", "on", "or", "the", "to",
-  "what", "which", "with", "why", "compare", "comparison", "explain",
-  "best", "current", "latest", "using", "use", "about",
-]);
-
 function normalize(text: string) {
-  return text
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  return text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
 }
 
-function getQueryTerms(query: string) {
-  return normalize(query)
-    .split(" ")
-    .filter((term) => term.length >= 2 && !STOP_WORDS.has(term));
+function queryTerms(query: string) {
+  const stop = new Set(["the", "and", "for", "with", "what", "how", "why", "are", "is", "of", "to", "in", "on", "a", "an", "compare", "explain", "tell", "about"]);
+  return [...new Set(normalize(query).split(" ").filter((word) => word.length > 2 && !stop.has(word)))];
 }
 
-function scoreSource(source: Source, query: string) {
-  const terms = getQueryTerms(query);
+function relevanceScore(query: string, source: Source) {
+  const terms = queryTerms(query);
   const title = normalize(source.title);
-  const snippet = normalize(source.snippet);
-  const full = `${title} ${snippet}`;
-
+  const text = normalize(`${source.title} ${source.snippet}`);
   if (!terms.length) return 0;
 
   let score = 0;
-
   for (const term of terms) {
-    if (title.includes(term)) score += 8;
-    if (snippet.includes(term)) score += 2;
+    if (title.includes(term)) score += 6;
+    else if (text.includes(term)) score += 2;
   }
 
-  // Strongly reward the presence of the main technical acronym/phrase.
-  const normalizedQuery = normalize(query);
-  if (normalizedQuery.includes("rag") && full.includes("rag")) score += 14;
-  if (normalizedQuery.includes("llm") && full.includes("llm")) score += 10;
-  if (normalizedQuery.includes("retrieval") && full.includes("retrieval")) score += 8;
-
-  // Academic papers are generally more useful for technical research.
-  if (source.type === "arXiv") score += 3;
-
-  // Penalize sources with no meaningful overlap at all.
-  const matchedTerms = terms.filter((term) => full.includes(term)).length;
-  if (matchedTerms === 0) score -= 20;
-
+  if (source.type === "arXiv") score += 1;
+  if (source.type === "OpenAlex") score += 0.5;
+  if (source.type === "Wikipedia") score += 0.25;
   return score;
 }
 
-function rankSources(sources: Source[], query: string) {
-  const unique = new Map<string, Source>();
-
-  for (const source of sources) {
-    const key = source.url.toLowerCase();
-    if (!unique.has(key)) unique.set(key, source);
-  }
-
-  return Array.from(unique.values())
-    .map((source) => ({ ...source, score: scoreSource(source, query) }))
-    .filter((source) => (source.score ?? 0) > 0)
+function rankSources(query: string, candidates: Source[]) {
+  const seen = new Set<string>();
+  return candidates
+    .map((source) => ({ ...source, score: relevanceScore(query, source) }))
+    .filter((source) => {
+      const key = `${normalize(source.title)}|${source.url}`;
+      if (seen.has(key) || (source.score ?? 0) < 2) return false;
+      seen.add(key);
+      return true;
+    })
     .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
-    .slice(0, 8)
-    .map(({ score: _score, ...source }, index) => ({
-      ...source,
-      id: `S${index + 1}`,
-    }));
+    .slice(0, 10)
+    .map((source, index) => ({ ...source, id: `S${index + 1}` }));
 }
 
 async function retrieveSources(query: string): Promise<Source[]> {
-  const sources: Source[] = [];
+  const candidates: Source[] = [];
+  const terms = queryTerms(query);
+  const technical = /\b(ai|ml|machine learning|deep learning|llm|rag|nlp|computer vision|neural|transformer|reinforcement learning|data science|cybersecurity|software engineering|algorithm)\b/i.test(query);
 
-  const [wikiResult, arxivResult] = await Promise.allSettled([
+  const jobs: Promise<Source[]>[] = [
     (async () => {
-      const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&format=json&srlimit=6&origin=*`;
-      const response = await fetch(wikiUrl, {
-        cache: "no-store",
-        signal: AbortSignal.timeout(10000),
-      });
-      if (!response.ok) return [] as Source[];
-
-      const data = await response.json();
-      return (data?.query?.search ?? []).map(
-        (item: { title: string; snippet?: string }) => ({
-          id: "",
-          title: item.title,
+      try {
+        const url = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&format=json&srlimit=8&origin=*`;
+        const response = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(10000) });
+        if (!response.ok) return [];
+        const data = await response.json();
+        return (data?.query?.search ?? []).map((item: { title: string; snippet?: string }) => ({
+          id: "", title: item.title,
           url: `https://en.wikipedia.org/wiki/${encodeURIComponent(item.title.replace(/ /g, "_"))}`,
-          snippet: String(item.snippet ?? "").replace(/<[^>]+>/g, ""),
-          type: "Wikipedia" as const,
-        })
-      );
+          snippet: String(item.snippet ?? "").replace(/<[^>]+>/g, ""), type: "Wikipedia" as const,
+        }));
+      } catch (error) { console.warn("Wikipedia retrieval failed:", error); return []; }
     })(),
     (async () => {
-      const arxivUrl = `https://export.arxiv.org/api/query?search_query=all:${encodeURIComponent(query)}&start=0&max_results=8&sortBy=relevance&sortOrder=descending`;
-      const response = await fetch(arxivUrl, {
-        cache: "no-store",
-        signal: AbortSignal.timeout(10000),
-      });
-      if (!response.ok) return [] as Source[];
-
-      const xml = await response.text();
-      const entries = xml.match(/<entry>[\s\S]*?<\/entry>/g) ?? [];
-
-      return entries
-        .map((entry): Source | null => {
-          const title = entry
-            .match(/<title>([\s\S]*?)<\/title>/)?.[1]
-            ?.replace(/\s+/g, " ")
-            .trim();
-          const summary = entry
-            .match(/<summary>([\s\S]*?)<\/summary>/)?.[1]
-            ?.replace(/\s+/g, " ")
-            .trim();
-          const id = entry.match(/<id>([\s\S]*?)<\/id>/)?.[1]?.trim();
-
-          if (!title || !id) return null;
-
-          return {
-            id: "",
-            title,
-            url: id,
-            snippet: summary ?? "",
-            type: "arXiv",
-          };
-        })
-        .filter(Boolean) as Source[];
+      try {
+        const search = terms.length ? terms.join(" OR ") : query;
+        const url = `https://api.openalex.org/works?search=${encodeURIComponent(search)}&per-page=8&sort=relevance_score:desc`;
+        const response = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(10000) });
+        if (!response.ok) return [];
+        const data = await response.json();
+        return (data?.results ?? []).map((item: any) => ({
+          id: "", title: item.display_name ?? "Untitled research work",
+          url: item.doi || item.primary_location?.landing_page_url || item.id,
+          snippet: item.abstract_inverted_index ? Object.keys(item.abstract_inverted_index).slice(0, 100).join(" ") : `${item.publication_year ?? ""} · Scholarly work · ${item.primary_location?.source?.display_name ?? "OpenAlex"}`,
+          type: "OpenAlex" as const,
+        }));
+      } catch (error) { console.warn("OpenAlex retrieval failed:", error); return []; }
     })(),
-  ]);
+  ];
 
-  if (wikiResult.status === "fulfilled") sources.push(...wikiResult.value);
-  if (arxivResult.status === "fulfilled") sources.push(...arxivResult.value);
+  if (technical) {
+    jobs.push((async () => {
+      try {
+        const url = `https://export.arxiv.org/api/query?search_query=all:${encodeURIComponent(query)}&start=0&max_results=8&sortBy=relevance&sortOrder=descending`;
+        const response = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(10000) });
+        if (!response.ok) return [];
+        const xml = await response.text();
+        const entries = xml.match(/<entry>[\s\S]*?<\/entry>/g) ?? [];
+        return entries.map((entry) => {
+          const title = entry.match(/<title>([\s\S]*?)<\/title>/)?.[1]?.replace(/\s+/g, " ").trim();
+          const summary = entry.match(/<summary>([\s\S]*?)<\/summary>/)?.[1]?.replace(/\s+/g, " ").trim();
+          const id = entry.match(/<id>([\s\S]*?)<\/id>/)?.[1]?.trim();
+          if (!title || !id) return null;
+          return { id: "", title, url: id, snippet: summary ?? "", type: "arXiv" as const };
+        }).filter(Boolean) as Source[];
+      } catch (error) { console.warn("arXiv retrieval failed:", error); return []; }
+    })());
+  }
 
-  return rankSources(sources, query);
+  const results = await Promise.allSettled(jobs);
+  for (const result of results) if (result.status === "fulfilled") candidates.push(...result.value);
+  return rankSources(query, candidates);
 }
 
 function buildFallbackAnswer(query: string, sources: Source[]) {
-  if (!sources.length) {
-    return `## Executive Summary\n\nI could not retrieve sufficiently relevant external sources for **${query}**.\n\n## Limitations\n\nNo source-backed answer can be generated until relevant evidence is available.`;
-  }
-
-  const findings = sources
-    .map(
-      (source) =>
-        `- **${source.title}** — ${source.snippet.slice(0, 500)} [${source.id}]`
-    )
-    .join("\n");
-
-  return `## Executive Summary\n\nHere is a source-backed research brief for **${query}**. The AI synthesis service was unavailable or timed out, so this response uses the retrieved evidence directly rather than inventing unsupported claims.\n\n## Key Findings\n\n${findings}\n\n## Important Insights\n\n- The retrieved evidence provides a starting point for answering the research question.\n- Claims should be checked against the linked primary sources before academic or professional use.\n\n## Limitations\n\n- Automated synthesis was unavailable for this request.\n- Retrieval results may be incomplete.\n\n## Further Research\n\nReview the linked sources and run the query again to generate a full AI-synthesized report.`;
+  if (!sources.length) return `## Executive Summary\n\nI could not retrieve external evidence for **${query}**. Try a more specific question.`;
+  const findings = sources.slice(0, 6).map((source) => `- **${source.title}** — ${source.snippet.slice(0, 450)} [${source.id}]`).join("\n");
+  return `## Executive Summary\n\nHere is a source-backed research brief for **${query}**. AI synthesis was unavailable, so the application is showing the strongest retrieved evidence directly.\n\n## Key Findings\n\n${findings}\n\n## Important Insights\n\n- Multiple independent sources can be compared to identify consistent findings.\n- OpenAlex provides cross-disciplinary scholarly literature; arXiv is added for technical/AI queries.\n\n## Limitations\n\n- Automated synthesis was unavailable for this request.\n- Retrieved evidence should be checked against the linked source before being used professionally.\n\n## Further Research\n\nOpen the highest-ranked sources and refine the query for a deeper report.`;
 }
 
 async function generateWithOpenRouter(apiKey: string, query: string, context: string) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
-
   try {
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-        "HTTP-Referer": "http://localhost:3000",
-        "X-Title": "Research Command Center",
-      },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, "HTTP-Referer": "http://localhost:3000", "X-Title": "Research Command Center" },
       signal: controller.signal,
       body: JSON.stringify({
-        model: "openai/gpt-oss-20b:free",
-        temperature: 0.2,
-        max_tokens: 1800,
+        model: "openai/gpt-oss-20b:free", temperature: 0.2, max_tokens: 1800,
         messages: [
-          {
-            role: "system",
-            content:
-              "You are a careful research assistant. Use ONLY the retrieved evidence supplied by the application. Do not invent studies, statistics, authors, dates, or citations. Cite claims with source IDs such as [S1]. If the evidence is insufficient, say so. Return concise Markdown with Executive Summary, Key Findings, Important Insights, Limitations, and Further Research.",
-          },
-          {
-            role: "user",
-            content: `Research question:\n${query}\n\nRetrieved evidence:\n${context}\n\nSynthesize the evidence into a useful research brief. Every factual claim that comes from a source should include its source ID.`,
-          },
+          { role: "system", content: "You are a careful general-purpose research assistant. Use ONLY the retrieved evidence supplied by the application. Do not invent studies, statistics, authors, dates, or citations. Cite factual claims with source IDs such as [S1]. If evidence is insufficient, say so. Return concise Markdown with Executive Summary, Key Findings, Important Insights, Limitations, and Further Research. Prefer primary or scholarly evidence when available." },
+          { role: "user", content: `Research question:\n${query}\n\nRetrieved evidence:\n${context}\n\nSynthesize a useful research brief. Every factual claim that comes from a source should include its source ID.` },
         ],
       }),
     });
-
-    const responseText = await response.text();
-
-    if (!response.ok) {
-      throw new Error(
-        `OpenRouter error (${response.status}): ${responseText.slice(0, 500)}`
-      );
-    }
-
-    const data = JSON.parse(responseText);
+    const text = await response.text();
+    if (!response.ok) throw new Error(`OpenRouter error (${response.status}): ${text.slice(0, 500)}`);
+    const data = JSON.parse(text);
     const answer = data?.choices?.[0]?.message?.content;
     if (!answer) throw new Error("The AI did not return a research response.");
     return answer as string;
-  } finally {
-    clearTimeout(timeout);
-  }
+  } finally { clearTimeout(timeout); }
 }
 
 export async function POST(request: NextRequest) {
   try {
     const apiKey = process.env.OPENROUTER_API_KEY;
-
-    if (!apiKey) {
-      return NextResponse.json(
-        {
-          error:
-            "OPENROUTER_API_KEY is missing. Add it to .env.local and restart the server.",
-        },
-        { status: 500 }
-      );
-    }
-
+    if (!apiKey) return NextResponse.json({ error: "OPENROUTER_API_KEY is missing. Add it to .env.local and restart the server." }, { status: 500 });
     const body = await request.json();
     const query = body.query;
+    if (!query || typeof query !== "string") return NextResponse.json({ error: "A research query is required." }, { status: 400 });
 
-    if (!query || typeof query !== "string") {
-      return NextResponse.json(
-        { error: "A research query is required." },
-        { status: 400 }
-      );
-    }
-
-    console.log("Retrieving and ranking sources for:", query);
+    console.log("Retrieving cross-domain sources for:", query);
     const sources = await retrieveSources(query);
+    const context = sources.length ? sources.map((source) => `[${source.id}] ${source.title}\nSource type: ${source.type}\nURL: ${source.url}\nEvidence: ${source.snippet}`).join("\n\n") : "No external sources were retrieved. Clearly state that limitation.";
 
-    const context = sources.length
-      ? sources
-          .map(
-            (source) =>
-              `[${source.id}] ${source.title}\nURL: ${source.url}\nEvidence: ${source.snippet}`
-          )
-          .join("\n\n")
-      : "No sufficiently relevant external sources were retrieved. Clearly state that limitation.";
+    let answer: string; let usedFallback = false;
+    try { answer = await generateWithOpenRouter(apiKey, query, context); }
+    catch (error) { console.warn("AI synthesis unavailable; using retrieval fallback:", error); answer = buildFallbackAnswer(query, sources); usedFallback = true; }
 
-    let answer: string;
-    let usedFallback = false;
-
-    try {
-      answer = await generateWithOpenRouter(apiKey, query, context);
-    } catch (error) {
-      console.warn(
-        "AI synthesis unavailable; returning retrieval fallback:",
-        error
-      );
-      answer = buildFallbackAnswer(query, sources);
-      usedFallback = true;
-    }
-
-    return NextResponse.json({
-      success: true,
-      query,
-      answer,
-      sources,
-      sourceCount: sources.length,
-      usedFallback,
-    });
+    return NextResponse.json({ success: true, query, answer, sources, sourceCount: sources.length, usedFallback, researchMode: "general-purpose" });
   } catch (error) {
     console.error("Research API error:", error);
-    return NextResponse.json(
-      {
-        error:
-          error instanceof Error ? error.message : "Unexpected server error.",
-      },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: error instanceof Error ? error.message : "Unexpected server error." }, { status: 500 });
   }
 }
