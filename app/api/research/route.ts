@@ -47,7 +47,7 @@ function retrieveKBChunks(query: string, chunks: KBChunk[]) {
     const hits = terms.reduce((count, term) => count + (text.includes(term) ? 1 : 0), 0);
     const phraseBonus = normalize(chunk.text).includes(normalize(query)) ? 4 : 0;
     return { chunk, score: hits + phraseBonus };
-  }).filter((item) => item.score > 0).sort((a, b) => b.score - a.score).slice(0, 5).map((item) => ({ id: "", title: item.chunk.documentName, url: "", snippet: item.chunk.text, type: "Knowledge Base" as const, score: item.score }));
+  }).filter((item) => item.score > 0).sort((a, b) => b.score - a.score).slice(0, 5).map((item) => ({ id: "", title: item.chunk.documentName, url: `/api/knowledge/file/${item.chunk.documentId}`, snippet: item.chunk.text, type: "Knowledge Base" as const, score: item.score }));
 }
 async function retrieveSources(query: string): Promise<Source[]> {
   const candidates: Source[] = []; const terms = queryTerms(query);
