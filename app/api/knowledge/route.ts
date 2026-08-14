@@ -7,6 +7,7 @@ export const runtime = "nodejs";
 
 const DATA_DIR = path.join(process.cwd(), "data");
 const DATA_FILE = path.join(DATA_DIR, "knowledge-base.json");
+const DOCUMENTS_DIR = path.join(DATA_DIR, "documents");
 
 type Chunk = {
   id: string;
@@ -19,6 +20,7 @@ type DocumentRecord = {
   id: string;
   name: string;
   type: string;
+  mimeType: string;
   size: number;
   createdAt: string;
   chunks: number;
@@ -100,13 +102,15 @@ export async function POST(request: NextRequest) {
     }
 
     const store = await readStore();
-    const documentId = `doc_${Date.now()}`;
+    const documentId = `doc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const pieces = chunkText(text);
+    const mimeType = file.type || (extension === "pdf" ? "application/pdf" : extension === "md" ? "text/markdown" : "text/plain");
 
     const document: DocumentRecord = {
       id: documentId,
       name: file.name,
       type: extension ?? file.type,
+      mimeType,
       size: file.size,
       createdAt: new Date().toISOString(),
       chunks: pieces.length,
@@ -119,6 +123,9 @@ export async function POST(request: NextRequest) {
       text: piece,
     }));
 
+    await fs.mkdir(DOCUMENTS_DIR, { recursive: true });
+    await fs.writeFile(path.join(DOCUMENTS_DIR, documentId), buffer);
+
     store.documents.unshift(document);
     store.chunks.push(...newChunks);
     await writeStore(store);
@@ -127,7 +134,7 @@ export async function POST(request: NextRequest) {
       success: true,
       document,
       chunkCount: newChunks.length,
-      message: `${file.name} was extracted and indexed into ${newChunks.length} searchable chunks.`,
+      message: `${file.name} was extracted, saved and indexed into ${newChunks.length} searchable chunks.`,
     });
   } catch (error) {
     console.error("Knowledge Base upload error:", error);
@@ -143,8 +150,12 @@ export async function DELETE(request: NextRequest) {
     const body = await request.json();
     const documentId = body.documentId;
     const store = await readStore();
+    const documentExists = store.documents.some((document) => document.id === documentId);
     store.documents = store.documents.filter((document) => document.id !== documentId);
     store.chunks = store.chunks.filter((chunk) => chunk.documentId !== documentId);
+    if (documentExists) {
+      try { await fs.unlink(path.join(DOCUMENTS_DIR, documentId)); } catch { /* legacy upload or missing file */ }
+    }
     await writeStore(store);
     return NextResponse.json({ success: true });
   } catch (error) {
